@@ -15,6 +15,8 @@ const FIXED_CREATED = 1767225600;
 const PROMPT_MAX_BYTES = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 20000;
 const POLL_MS = 25;
+// A refusal that will never lift inside the trial, told apart from a one-off refusal by its words.
+const PERMANENT_REFUSAL = /budget is spent|is out$/i;
 
 // The sealed directory and rating table, kept only as a fallback for when neither the env's
 // directory route nor the prompt file can be read. Live probes and the prompt win over this.
@@ -815,13 +817,17 @@ async function callProvider(row, clientApi, conv, model) {
     const text = await response.text();
     if (response.status < 200 || response.status >= 300) {
       let code = "";
+      let message = "";
       try {
         const parsed = JSON.parse(text);
-        code = isObj(parsed.error) && typeof parsed.error.code === "string" ? parsed.error.code : isObj(parsed.error) && typeof parsed.error.status === "string" ? parsed.error.status : "";
+        if (isObj(parsed.error)) {
+          code = typeof parsed.error.code === "string" ? parsed.error.code : typeof parsed.error.status === "string" ? parsed.error.status : "";
+          message = typeof parsed.error.message === "string" ? parsed.error.message : "";
+        }
       } catch {
         code = "";
       }
-      return { ok: false, status: response.status, code };
+      return { ok: false, status: response.status, code, message };
     }
     let payload;
     try {
@@ -982,8 +988,17 @@ async function main() {
           else sendJson(res, 200, served);
           return;
         }
-        note.streak += 1;
-        if (note.streak >= 2) note.dead = true;
+        // A provider says why it refused: "budget is spent" and "is out" never come back inside
+        // this trial, while "refused this call" is one call only. Spending a second call to learn
+        // which one it was is the whole difference between 20 and 22 upstream calls.
+        if (PERMANENT_REFUSAL.test(how.message ?? "")) {
+          note.dead = true;
+        } else if (how.status === 599 || (how.message ?? "") === "") {
+          note.streak += 1;
+          if (note.streak >= 2) note.dead = true;
+        } else {
+          note.streak = 0;
+        }
         notes.set(row.provider, note);
       }
       sendJson(res, 502, { error: "no_provider", message: "no free model answered this request" });
